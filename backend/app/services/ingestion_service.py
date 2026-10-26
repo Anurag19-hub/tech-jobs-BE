@@ -6,8 +6,6 @@ from urllib.parse import urlparse
 from app.database import supabase
 
 
-# Initial verified company mappings.
-# We will replace this static mapping with dynamic company discovery later.
 KNOWN_COMPANIES = {
     "ibm": {
         "name": "IBM",
@@ -39,6 +37,24 @@ COUNTRY_ALIASES = {
     "mexico": "Mexico",
 }
 
+INDIAN_LOCATIONS = {
+    "ahmedabad", "bengaluru", "bangalore", "hyderabad", "pune",
+    "mumbai", "gurgaon", "gurugram", "noida", "new delhi", "delhi",
+    "chennai", "kolkata", "kochi", "cochin", "jaipur", "lucknow",
+    "chandigarh", "indore", "bhopal", "surat", "vadodara",
+    "gandhinagar", "rajkot", "nagpur", "coimbatore", "visakhapatnam",
+    "vizag", "thiruvananthapuram", "trivandrum", "mysuru", "mysore",
+    "mangalore", "mangaluru", "nashik", "patna", "ranchi",
+    "bhubaneswar", "dehradun", "guwahati", "faridabad", "ghaziabad",
+    "greater noida", "andhra pradesh", "arunachal pradesh", "assam",
+    "bihar", "chhattisgarh", "goa", "gujarat", "haryana",
+    "himachal pradesh", "jharkhand", "karnataka", "kerala",
+    "madhya pradesh", "maharashtra", "manipur", "meghalaya",
+    "mizoram", "nagaland", "odisha", "punjab", "rajasthan",
+    "sikkim", "tamil nadu", "telangana", "tripura", "uttar pradesh",
+    "uttarakhand", "west bengal", "jammu and kashmir", "ladakh",
+}
+
 
 def normalize_name(value: str) -> str:
     """Normalize a company name or job title for matching."""
@@ -46,13 +62,12 @@ def normalize_name(value: str) -> str:
 
 
 def infer_country(location: str | None) -> str | None:
-    """Infer a country only when a known country is present."""
-    if not location:
+    """Infer a country only when a known country name or alias is present."""
+    if not isinstance(location, str) or not location.strip():
         return None
 
     normalized = location.casefold()
 
-    # Check longer aliases first to avoid matching a short alias too early.
     for alias in sorted(COUNTRY_ALIASES, key=len, reverse=True):
         if re.search(
             rf"(?<![a-z]){re.escape(alias)}(?![a-z])",
@@ -61,6 +76,33 @@ def infer_country(location: str | None) -> str | None:
             return COUNTRY_ALIASES[alias]
 
     return None
+
+
+def validate_india_location(location: str | None) -> list[str]:
+    """Accept India or recognized Indian city/state locations only."""
+    if not isinstance(location, str) or not location.strip():
+        return ["Missing job location; cannot verify that the job is in India"]
+
+    normalized = location.casefold().strip()
+    country = infer_country(location)
+
+    if country and country != "India":
+        return [f"Non-India location detected: {country}"]
+
+    if country == "India":
+        return []
+
+    for place in sorted(INDIAN_LOCATIONS, key=len, reverse=True):
+        if re.search(
+            rf"(?<![a-z]){re.escape(place)}(?![a-z])",
+            normalized,
+        ):
+            return []
+
+    return [
+        "Location does not identify India or a recognized Indian city/state; "
+        "manual verification required"
+    ]
 
 
 def company_metadata(company_name: str) -> dict:
@@ -76,44 +118,39 @@ def company_metadata(company_name: str) -> dict:
 
 
 def validate_job(job: dict) -> list[str]:
-    """Validate a job without changing the database."""
+    """Validate required fields and India-only location eligibility."""
     errors = []
 
     for field in ("title", "company", "source_url", "apply_url"):
         value = job.get(field)
-
         if not isinstance(value, str) or not value.strip():
             errors.append(f"Missing required value: {field}")
 
     for field in ("source_url", "apply_url"):
         value = job.get(field)
-
         if not isinstance(value, str) or not value.strip():
             continue
 
         parsed = urlparse(value)
-
         if parsed.scheme != "https" or not parsed.netloc:
             errors.append(f"{field} must be a valid HTTPS URL")
 
     source_job_id = job.get("source_job_id")
-
     if source_job_id is None or not str(source_job_id).strip():
         errors.append(
             "Missing stable source_job_id; cannot safely deduplicate"
         )
 
     company = job.get("company")
-
     if isinstance(company, str) and company.strip():
         if company.strip().casefold() not in KNOWN_COMPANIES:
             errors.append(f"Unverified company: {company}")
 
     description = job.get("description")
-
     if description is not None and not isinstance(description, str):
         errors.append("description must be text or None")
 
+    errors.extend(validate_india_location(job.get("location")))
     return errors
 
 
@@ -126,7 +163,6 @@ def find_existing_company(normalized_name: str) -> dict | None:
         .limit(1)
         .execute()
     )
-
     return result.data[0] if result.data else None
 
 
@@ -143,24 +179,23 @@ def find_existing_job(
         .limit(1)
         .execute()
     )
-
     return result.data[0] if result.data else None
 
 
 def build_job_payload(job: dict, company_id: int) -> dict:
-    """Build a payload matching the existing Supabase jobs table."""
+    """Build a job payload without a database-generated ID."""
     title = job["title"].strip()
     company = company_metadata(job["company"])
-
-    location = job.get("location")
-    country = infer_country(location)
+    location = job["location"].strip()
+    country = infer_country(location) or "India"
     now = datetime.now(timezone.utc).isoformat()
 
     payload = {
         "company_id": company_id,
         "title": title,
         "normalized_title": normalize_name(title),
-        "location": location.strip() if location else None,
+        "location": location,
+        "country": country,
         "job_type": job.get("job_type"),
         "description": job.get("description"),
         "apply_url": job["apply_url"].strip(),
@@ -171,11 +206,6 @@ def build_job_payload(job: dict, company_id: int) -> dict:
         "updated_at": now,
     }
 
-    # Do not overwrite the database's default country with None.
-    if country:
-        payload["country"] = country
-
-    # Include optional fields only when a reliable value is available.
     for field in (
         "workplace_type",
         "experience_level",
@@ -184,32 +214,19 @@ def build_job_payload(job: dict, company_id: int) -> dict:
         "published_at",
     ):
         value = job.get(field)
-
         if value is not None and value != "":
             payload[field] = value
 
     return payload
 
 
-def merge_existing_job(existing: dict, new: dict) -> dict:
-    """Update supplied values while retaining existing useful data."""
-    merged = dict(existing)
-
-    for key, value in new.items():
-        if value is not None and value != "":
-            merged[key] = value
-
-    return merged
-
-
 def upsert_company(company_name: str, source_url: str) -> dict:
     """
-    Create or update a company using its unique normalized name.
-    PostgreSQL generates the identity ID automatically.
+    Insert a company or update its supplied fields.
+    Never send the identity ID back in an UPDATE.
     """
     metadata = company_metadata(company_name)
     normalized_name = normalize_name(metadata["name"])
-
     existing = find_existing_company(normalized_name)
 
     company_payload = {
@@ -223,20 +240,16 @@ def upsert_company(company_name: str, source_url: str) -> dict:
     }
 
     if existing:
-        # Preserve existing optional data if no replacement was supplied.
-        merged = dict(existing)
-
-        for key, value in company_payload.items():
-            if value is not None and value != "":
-                merged[key] = value
-
+        # Update only the fields we intend to change.
+        # This preserves other existing columns and omits "id".
         result = (
             supabase.table("companies")
-            .update(merged)
+            .update(company_payload)
             .eq("id", existing["id"])
             .execute()
         )
     else:
+        # PostgreSQL generates the identity ID.
         result = (
             supabase.table("companies")
             .insert(company_payload)
@@ -244,32 +257,38 @@ def upsert_company(company_name: str, source_url: str) -> dict:
         )
 
     if not result.data:
+        # A concurrent insert could have created the company after our
+        # initial lookup. Re-fetch it rather than attempting an unsafe update.
+        current = find_existing_company(normalized_name)
+        if current:
+            return current
         raise RuntimeError("Company save returned no record.")
 
     return result.data[0]
 
 
 def save_job(job: dict, company_id: int) -> str:
-    """
-    Insert a new job or update an existing job.
-    Returns 'insert' or 'update'.
-    """
+    """Insert a new job or update an existing job without updating its ID."""
     company = company_metadata(job["company"])
     source_name = f"{company['name']} Careers"
     source_job_id = str(job["source_job_id"]).strip()
 
     payload = build_job_payload(job, company_id)
-
     existing = find_existing_job(source_name, source_job_id)
 
     if existing:
-        merged = merge_existing_job(existing, payload)
+        # Keep existing values when the new extraction has None or "".
+        # Only send intended editable fields; never send existing["id"].
+        update_payload = {
+            key: value
+            for key, value in payload.items()
+            if value is not None and value != ""
+        }
 
         result = (
             supabase.table("jobs")
-            .update(merged)
-            .eq("source_name", source_name)
-            .eq("source_job_id", source_job_id)
+            .update(update_payload)
+            .eq("id", existing["id"])
             .execute()
         )
 
@@ -278,13 +297,27 @@ def save_job(job: dict, company_id: int) -> str:
 
         return "update"
 
-    result = (
-        supabase.table("jobs")
-        .insert(payload)
-        .execute()
-    )
+    # The database generates the identity ID on insertion.
+    result = supabase.table("jobs").insert(payload).execute()
 
     if not result.data:
+        # Handle a concurrent insert without attempting to update the ID.
+        current = find_existing_job(source_name, source_job_id)
+        if current:
+            update_payload = {
+                key: value
+                for key, value in payload.items()
+                if value is not None and value != ""
+            }
+            result = (
+                supabase.table("jobs")
+                .update(update_payload)
+                .eq("id", current["id"])
+                .execute()
+            )
+            if result.data:
+                return "update"
+
         raise RuntimeError("Job insert returned no record.")
 
     return "insert"
@@ -294,15 +327,7 @@ def ingest_jobs(
     jobs: list[dict],
     dry_run: bool = True,
 ) -> dict:
-    """
-    Validate and plan or perform ingestion.
-
-    dry_run=True:
-        Read-only database checks; no inserts or updates.
-
-    dry_run=False:
-        Save valid companies and jobs to Supabase.
-    """
+    """Validate and plan or perform ingestion."""
     report = {
         "mode": "dry-run" if dry_run else "live",
         "records_received": len(jobs),
@@ -347,23 +372,18 @@ def ingest_jobs(
 
         try:
             existing_company = find_existing_company(normalized_company)
-
-            if existing_company:
-                company_id = existing_company["id"]
-            else:
-                company_id = None
-
-            payload = build_job_payload(job, company_id or 0)
-            existing_job = find_existing_job(
-                source_name,
-                source_job_id,
-            )
+            existing_job = find_existing_job(source_name, source_job_id)
 
             action = "update" if existing_job else "insert"
+            company_id = existing_company["id"] if existing_company else 0
+            payload = build_job_payload(job, company_id)
 
             report["valid_records"] += 1
 
-            if not existing_company and normalized_company not in company_cache:
+            if (
+                not existing_company
+                and normalized_company not in company_cache
+            ):
                 report["companies_to_insert"] += 1
                 company_cache[normalized_company] = True
 
@@ -378,23 +398,19 @@ def ingest_jobs(
                 "source_name": source_name,
                 "source_job_id": source_job_id,
                 "action": action,
-                "country": payload.get("country", "India (database default)"),
-                "location": payload.get("location"),
+                "country": payload["country"],
+                "location": payload["location"],
             })
 
             if dry_run:
                 continue
 
-            # Create or reuse the company before saving its job.
             company_record = upsert_company(
                 job["company"],
                 job["source_url"],
             )
 
-            saved_action = save_job(
-                job,
-                company_record["id"],
-            )
+            saved_action = save_job(job, company_record["id"])
 
             report["actions"][-1]["action"] = saved_action
             report["actions"][-1]["company_id"] = company_record["id"]

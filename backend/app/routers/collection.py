@@ -13,6 +13,7 @@ from app.services.discovery_service import (
     discover_job_links,
     firecrawl,
     get_field,
+    call_firecrawl,
 )
 from app.services.job_extractor import (
     extract_job_details,
@@ -116,24 +117,61 @@ def update_collection_log(
     )
 
 
+def is_job_detail_url(url: str) -> bool:
+    """Identify likely individual job-detail URLs."""
+    parsed = urlparse(url)
+    path = parsed.path.lower()
+
+    return (
+        "/jobdetail" in path
+        or "/careers/job/" in path
+        or "/careers/jobs/" in path
+        or "/jobs/" in path
+        or "/job/" in path
+        or "/positions/" in path
+    )
+
+
 def discover_candidate_urls(
     query: str,
     max_candidates: int,
 ) -> list[str]:
-    """Search the web and collect candidate job-detail URLs."""
+    """
+    Discover job URLs while limiting unnecessary career-page scrapes.
+
+    Direct job-detail results are prioritized. At most two additional
+    non-detail pages are inspected for each query.
+    """
     search_results = search_company_career_pages(
         query,
         limit=5,
     )
 
     candidate_urls = []
+    pages_to_inspect = []
 
+    # Prefer search results that already point to individual job pages.
     for result in search_results:
         page_url = result.get("url", "")
 
         if not page_url or not get_company_from_url(page_url):
             continue
 
+        if is_job_detail_url(page_url):
+            candidate_urls.append(page_url)
+        else:
+            pages_to_inspect.append(page_url)
+
+    # Remove duplicate direct results.
+    candidate_urls = list(dict.fromkeys(candidate_urls))
+
+    if len(candidate_urls) >= max_candidates:
+        return candidate_urls[:max_candidates]
+
+    # Only inspect up to two additional pages per query.
+    pages_to_inspect = list(dict.fromkeys(pages_to_inspect))[:2]
+
+    for page_url in pages_to_inspect:
         try:
             discovered = discover_job_links(page_url)
 
@@ -141,33 +179,28 @@ def discover_candidate_urls(
                 if get_company_from_url(url):
                     candidate_urls.append(url)
 
-            # Include search results that are already job-detail pages.
-            path = urlparse(page_url).path.lower()
+            candidate_urls = list(dict.fromkeys(candidate_urls))
 
-            if (
-                "/jobdetail" in path
-                or "/careers/job/" in path
-                or "/careers/apply/" in path
-            ):
-                candidate_urls.append(page_url)
+            if len(candidate_urls) >= max_candidates:
+                break
 
-        except Exception:
+        except Exception as exc:
             # One inaccessible page should not stop other discovery.
-            continue
-
-        candidate_urls = list(dict.fromkeys(candidate_urls))
-
-        if len(candidate_urls) >= max_candidates:
-            break
+            print(
+                f"Could not inspect career page {page_url}: "
+                f"{str(exc)[:200]}"
+            )
 
     return candidate_urls[:max_candidates]
 
 
 def scrape_job(url: str) -> dict | None:
-    """Scrape and extract one candidate job page."""
-    result = firecrawl.scrape(
-        url,
-        formats=["markdown"],
+    """Scrape and extract one candidate job page with rate-limit handling."""
+    result = call_firecrawl(
+        lambda: firecrawl.scrape(
+            url,
+            formats=["markdown"],
+        )
     )
 
     data = get_field(result, "data", result)
@@ -228,6 +261,7 @@ def run_collection(
                     "error": str(exc)[:300],
                 })
 
+        # Remove duplicate URLs and apply the requested limit.
         candidate_urls = list(dict.fromkeys(candidate_urls))
         candidate_urls = candidate_urls[:request.max_jobs]
 
@@ -245,7 +279,7 @@ def run_collection(
                     "error": str(exc)[:300],
                 })
 
-        # Dry run is the default. Live writes require explicit request.
+        # Dry-run is the default; live writes require explicit request.
         report = ingest_jobs(
             extracted_jobs,
             dry_run=request.dry_run,
@@ -265,7 +299,7 @@ def run_collection(
         else:
             status = "success"
 
-        # These are actual writes only in live mode.
+        # Count successful database actions only in live mode.
         inserted = 0
         updated = 0
 
@@ -284,6 +318,7 @@ def run_collection(
                 elif action.get("action") == "update":
                     updated += 1
 
+        # Update the collection log.
         update_collection_log(
             log_id=log_id,
             status=status,
@@ -300,6 +335,7 @@ def run_collection(
             ),
         )
 
+        # Return the extraction preview for verification.
         return {
             "message": "Collection run finished.",
             "log_id": log_id,
@@ -309,6 +345,18 @@ def run_collection(
             "candidate_urls": len(candidate_urls),
             "records_extracted": len(extracted_jobs),
             "valid_records": report["valid_records"],
+            "extracted_preview": [
+                {
+                    "company": job.get("company"),
+                    "title": job.get("title"),
+                    "location": job.get("location"),
+                    "job_type": job.get("job_type"),
+                    "source_job_id": job.get("source_job_id"),
+                    "source_url": job.get("source_url"),
+                    "apply_url": job.get("apply_url"),
+                }
+                for job in extracted_jobs
+            ],
             "rejected": report["rejected"],
             "errors": all_errors,
             "ingestion_report": report,
