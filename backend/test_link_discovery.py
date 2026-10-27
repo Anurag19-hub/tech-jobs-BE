@@ -28,10 +28,10 @@ else:
 candidates = filter_job_links(links)
 
 print(f"\nTotal links extracted: {len(links)}")
-print(f"Potential job/career links: {len(candidates)}")
-
-for index, candidate in enumerate(candidates[:25], start=1):
-    print(f"{index}. {candidate}")
+for category, items in candidates.items():
+    print(f"\n{category} ({len(items)}):")
+    for index, candidate in enumerate(items[:10], start=1):
+        print(f"  {index}. {candidate}")
 
 if not candidates:
     print(

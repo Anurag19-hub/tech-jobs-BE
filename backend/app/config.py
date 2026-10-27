@@ -1,4 +1,4 @@
-﻿
+
 from functools import lru_cache
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -12,6 +12,7 @@ class Settings(BaseSettings):
 
     supabase_url: str
     supabase_key: str
+    supabase_secret_key: str = ""
 
     # Set COLLECTION_API_KEY in backend/.env.
     # An empty value disables collection endpoint access.

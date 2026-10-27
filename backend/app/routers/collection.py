@@ -1,5 +1,6 @@
 
 import secrets
+import time
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
@@ -268,6 +269,7 @@ def run_collection(
         # Scrape each unique candidate URL.
         for url in candidate_urls:
             try:
+                time.sleep(1.5)
                 job = scrape_job(url)
 
                 if job:
