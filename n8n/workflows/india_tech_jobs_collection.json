@@ -1,0 +1,183 @@
+{
+  "name": "India Tech Jobs Collection & Intelligence",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 6
+            }
+          ]
+        }
+      },
+      "id": "node-schedule-trigger",
+      "name": "Schedule (Every 6 Hours)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        220,
+        300
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "node-manual-trigger",
+      "name": "Manual Test Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        220,
+        140
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "backend_url",
+              "name": "backend_url",
+              "value": "http://127.0.0.1:8000/api/v1/collection/run",
+              "type": "string"
+            },
+            {
+              "id": "collection_api_key",
+              "name": "collection_api_key",
+              "value": "={{ $env.COLLECTION_API_KEY || 'test-collection-key-123' }}",
+              "type": "string"
+            },
+            {
+              "id": "dry_run",
+              "name": "dry_run",
+              "value": true,
+              "type": "boolean"
+            },
+            {
+              "id": "max_jobs",
+              "name": "max_jobs",
+              "value": 10,
+              "type": "number"
+            },
+            {
+              "id": "queries",
+              "name": "queries",
+              "value": [
+                "Software Engineer jobs Bengaluru India",
+                "Backend Developer jobs Hyderabad India",
+                "Full Stack Engineer jobs Pune India",
+                "Frontend React Developer jobs Gurgaon India"
+              ],
+              "type": "array"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-set-config",
+      "name": "Configure Collection Parameters",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        460,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.backend_url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Collection-Key",
+              "value": "={{ $json.collection_api_key }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"queries\": {{ JSON.stringify($json.queries) }},\n  \"max_jobs\": {{ $json.max_jobs }},\n  \"dry_run\": {{ $json.dry_run }}\n}",
+        "options": {
+          "timeout": 300000
+        }
+      },
+      "id": "node-http-fastapi",
+      "name": "Dispatch to FastAPI Collection API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        700,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse the FastAPI response and format an intelligence summary\nconst res = $input.first().json;\n\nconst mode = res.mode || (res.ingestion_report ? res.ingestion_report.mode : 'unknown');\nconst status = res.status || 'unknown';\nconst recordsExtracted = res.records_extracted || 0;\nconst validRecords = res.valid_records || 0;\nconst rejectedList = res.rejected || [];\nconst errorsList = res.errors || [];\n\nconst actions = (res.ingestion_report && res.ingestion_report.actions) || [];\nconst insertedCount = actions.filter(a => a.action === 'insert').length;\nconst updatedCount = actions.filter(a => a.action === 'update').length;\n\nconst summaryText = `\n========================================\n🇮🇳 IndiaTechIntelligence Collection Run\n========================================\nStatus: ${status.toUpperCase()}\nMode: ${mode.toUpperCase()}\nCandidates Scraped: ${recordsExtracted}\nValid India Records: ${validRecords}\nPlanned / Written Inserts: ${insertedCount}\nPlanned / Written Updates: ${updatedCount}\nRejected Records: ${rejectedList.length}\nErrors Encountered: ${errorsList.length}\n\nTop Extracted Jobs:\n${actions.slice(0, 5).map(a => `• [${a.company}] ${a.title} (${a.location || 'India'}) -> ${a.action.toUpperCase()}`).join('\\n') || 'None'}\n\n${rejectedList.length > 0 ? 'Sample Rejections:\\n' + rejectedList.slice(0, 3).map(r => `• ${r.title}: ${r.errors.join(', ')}`).join('\\n') : ''}\n========================================\n`;\n\nreturn [{\n  json: {\n    status,\n    mode,\n    recordsExtracted,\n    validRecords,\n    insertedCount,\n    updatedCount,\n    rejectedCount: rejectedList.length,\n    errorsCount: errorsList.length,\n    summaryText,\n    raw_response: res\n  }\n}];"
+      },
+      "id": "node-format-summary",
+      "name": "Format Collection Summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        940,
+        220
+      ]
+    }
+  ],
+  "connections": {
+    "node-manual-trigger": {
+      "main": [
+        [
+          {
+            "node": "node-set-config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "node-schedule-trigger": {
+      "main": [
+        [
+          {
+            "node": "node-set-config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "node-set-config": {
+      "main": [
+        [
+          {
+            "node": "node-http-fastapi",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "node-http-fastapi": {
+      "main": [
+        [
+          {
+            "node": "node-format-summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
