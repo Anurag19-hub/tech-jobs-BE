@@ -40,43 +40,94 @@ COUNTRY_ALIASES = {
 }
 
 
+RESTRICTED_TITLE_PATTERNS = [
+    r"\bexecutive\s+referrals?\b",
+    r"\breferrals?\s+only\b",
+    r"\binternal\s+(?:candidates?|applicants?|employees?|transfers?)\s+only\b",
+    r"\bfor\s+internal\s+(?:candidates?|applicants?|employees?)\b",
+    r"\bpipeline\s+(?:requisition|req)\b",
+    r"\btalent\s+pool\s+only\b",
+    r"\bdo\s+not\s+apply\b",
+]
+
+INDIAN_LOCATIONS = {
+    # Major Tech Cities
+    "bangalore", "bengaluru", "hyderabad", "pune", "mumbai", "gurgaon", "gurugram",
+    "noida", "delhi", "new delhi", "chennai", "kolkata", "ahmedabad", "kochi",
+    "cochin", "trivandrum", "thiruvananthapuram", "chandigarh", "jaipur", "indore",
+    "coimbatore", "bhubaneswar", "nagpur", "vadodara", "surat", "visakhapatnam",
+    "mysore", "mysuru", "lucknow",
+    # States & Territories
+    "karnataka", "telangana", "maharashtra", "tamil nadu", "haryana",
+    "uttar pradesh", "delhi ncr", "kerala", "gujarat", "west bengal",
+    "rajasthan", "madhya pradesh", "punjab", "odisha", "andhra pradesh",
+}
+
+
 def normalize_name(value: str) -> str:
     """Normalize a company name or job title for matching."""
     return re.sub(r"\s+", " ", value.strip()).casefold()
 
 
 def infer_country(location: str | None) -> str | None:
-    """Infer a country only when a known country is present."""
+    """Infer a country from location evidence, supporting Indian cities and states."""
     if not location:
         return None
 
     normalized = location.casefold()
 
-    # Check longer aliases first to avoid matching a short alias too early.
+    # Check for explicit non-India countries first
     for alias in sorted(COUNTRY_ALIASES, key=len, reverse=True):
-        if re.search(
+        if alias != "india" and re.search(
             rf"(?<![a-z]){re.escape(alias)}(?![a-z])",
             normalized,
         ):
             return COUNTRY_ALIASES[alias]
 
+    # Explicit India mention
+    if re.search(r"(?<![a-z])india(?![a-z])", normalized):
+        return "India"
+
+    # Known Indian cities or states
+    for ind_loc in INDIAN_LOCATIONS:
+        if re.search(rf"(?<![a-z]){re.escape(ind_loc)}(?![a-z])", normalized):
+            return "India"
+
     return None
 
 
-def company_metadata(company_name: str) -> dict:
-    """Return metadata for a supported company."""
+def company_metadata(company_name: str, source_url: str = "") -> dict:
+    """Return metadata for a company, dynamically generating details if unlisted."""
     key = company_name.strip().casefold()
 
-    if key not in KNOWN_COMPANIES:
-        raise ValueError(
-            f"Company '{company_name}' is not in the verified company map."
-        )
+    if key in KNOWN_COMPANIES:
+        return KNOWN_COMPANIES[key]
 
-    return KNOWN_COMPANIES[key]
+    website = ""
+    careers_url = ""
+    if source_url:
+        parsed = urlparse(source_url)
+        if parsed.scheme and parsed.netloc:
+            netloc = parsed.netloc
+            main_domain = re.sub(
+                r"^(?:apply|careers|jobs|tech|corp)\.",
+                "",
+                netloc,
+                flags=re.IGNORECASE,
+            )
+            website = f"{parsed.scheme}://{main_domain}"
+            careers_url = f"{parsed.scheme}://{netloc}"
+
+    clean_name = company_name.strip()
+    return {
+        "name": clean_name,
+        "website": website or f"https://www.{key}.com",
+        "careers_url": careers_url or source_url,
+    }
 
 
 def validate_job(job: dict) -> list[str]:
-    """Validate a job without changing the database."""
+    """Validate a job against required fields, India eligibility, and restricted listings."""
     errors = []
 
     for field in ("title", "company", "source_url", "apply_url"):
@@ -84,6 +135,16 @@ def validate_job(job: dict) -> list[str]:
 
         if not isinstance(value, str) or not value.strip():
             errors.append(f"Missing required value: {field}")
+
+    # Exclude clearly restricted listings (referrals only, internal requisitions)
+    title = job.get("title")
+    if isinstance(title, str) and title.strip():
+        for pattern in RESTRICTED_TITLE_PATTERNS:
+            if re.search(pattern, title, re.IGNORECASE):
+                errors.append(
+                    f"Restricted or internal-only listing not eligible for public dashboard: '{title}'"
+                )
+                break
 
     for field in ("source_url", "apply_url"):
         value = job.get(field)
@@ -104,10 +165,20 @@ def validate_job(job: dict) -> list[str]:
         )
 
     company = job.get("company")
-
     if isinstance(company, str) and company.strip():
-        if company.strip().casefold() not in KNOWN_COMPANIES:
-            errors.append(f"Unverified company: {company}")
+        if len(company.strip()) < 2 or len(company.strip()) > 100:
+            errors.append(f"Invalid company name length: '{company}'")
+
+    # India-only validation
+    location = job.get("location")
+    if not location or not isinstance(location, str) or not location.strip():
+        errors.append("Missing location; cannot verify India eligibility")
+    else:
+        country = infer_country(location)
+        if country and country != "India":
+            errors.append(f"Job is located outside India ({country}): '{location}'")
+        elif not country:
+            errors.append(f"Ambiguous or missing India location evidence: '{location}'")
 
     description = job.get("description")
 
@@ -150,7 +221,7 @@ def find_existing_job(
 def build_job_payload(job: dict, company_id: int) -> dict:
     """Build a payload matching the existing Supabase jobs table."""
     title = job["title"].strip()
-    company = company_metadata(job["company"])
+    company = company_metadata(job["company"], job.get("source_url", ""))
 
     location = job.get("location")
     country = infer_country(location)
@@ -254,7 +325,7 @@ def save_job(job: dict, company_id: int) -> str:
     Insert a new job or update an existing job.
     Returns 'insert' or 'update'.
     """
-    company = company_metadata(job["company"])
+    company = company_metadata(job["company"], job.get("source_url", ""))
     source_name = f"{company['name']} Careers"
     source_job_id = str(job["source_job_id"]).strip()
 
@@ -329,7 +400,7 @@ def ingest_jobs(
             })
             continue
 
-        metadata = company_metadata(job["company"])
+        metadata = company_metadata(job["company"], job.get("source_url", ""))
         normalized_company = normalize_name(metadata["name"])
         source_name = f"{metadata['name']} Careers"
         source_job_id = str(job["source_job_id"]).strip()

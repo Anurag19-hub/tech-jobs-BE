@@ -19,32 +19,150 @@ COUNTRY_PATTERN = (
 
 JOB_TYPE_MAP = {
     "internship": "Internship",
+    "intern": "Internship",
+    "co-op": "Internship",
+    "apprentice": "Internship",
     "full-time": "Full-Time",
     "full time": "Full-Time",
+    "regular": "Full-Time",
+    "permanent": "Full-Time",
+    "professional": "Full-Time",
+    "early professional": "Full-Time",
     "part-time": "Part-Time",
     "part time": "Part-Time",
     "contract": "Contract",
+    "contractor": "Contract",
     "temporary": "Temporary",
-    "permanent": "Permanent",
+    "fixed term": "Contract",
+    "fixed-term": "Contract",
 }
 
 
+KNOWN_COMPANY_OVERRIDES = {
+    "ibm": "IBM",
+    "microsoft": "Microsoft",
+    "tcs": "TCS",
+    "infosys": "Infosys",
+    "wipro": "Wipro",
+    "hcl": "HCLTech",
+    "hcltech": "HCLTech",
+    "techmahindra": "Tech Mahindra",
+    "lti": "LTIMindtree",
+    "ltimindtree": "LTIMindtree",
+    "cognizant": "Cognizant",
+    "accenture": "Accenture",
+    "capgemini": "Capgemini",
+    "google": "Google",
+    "amazon": "Amazon",
+    "meta": "Meta",
+    "apple": "Apple",
+    "netflix": "Netflix",
+    "flipkart": "Flipkart",
+    "swiggy": "Swiggy",
+    "zomato": "Zomato",
+    "paytm": "Paytm",
+    "phonepe": "PhonePe",
+    "razorpay": "Razorpay",
+    "cred": "CRED",
+    "meesho": "Meesho",
+    "zerodha": "Zerodha",
+    "groww": "Groww",
+    "ola": "Ola",
+    "uber": "Uber",
+    "jio": "Jio",
+    "airtel": "Airtel",
+    "oracle": "Oracle",
+    "cisco": "Cisco",
+    "salesforce": "Salesforce",
+    "adobe": "Adobe",
+    "intel": "Intel",
+    "nvidia": "Nvidia",
+    "qualcomm": "Qualcomm",
+    "amd": "AMD",
+    "samsung": "Samsung",
+}
+
+ATS_PATH_HOSTS = {
+    "greenhouse.io",
+    "boards.greenhouse.io",
+    "lever.co",
+    "jobs.lever.co",
+    "ashbyhq.com",
+    "jobs.ashbyhq.com",
+    "smartrecruiters.com",
+    "jobs.smartrecruiters.com",
+}
+
+ATS_SUBDOMAIN_SUFFIXES = [
+    ".myworkdayjobs.com",
+    ".workdayjobs.com",
+    ".bamboohr.com",
+    ".darwinbox.in",
+    ".recruitee.com",
+    ".freshteam.com",
+    ".breezy.hr",
+    ".teamtailor.com",
+]
+
+
+def clean_company_name(slug: str) -> str:
+    """Format a company slug into a readable company name."""
+    cleaned = re.sub(r"[-_]+", " ", slug.strip()).strip()
+    key = cleaned.casefold().replace(" ", "")
+
+    if key in KNOWN_COMPANY_OVERRIDES:
+        return KNOWN_COMPANY_OVERRIDES[key]
+
+    # Handle short acronyms
+    if len(cleaned) <= 3:
+        return cleaned.upper()
+
+    return cleaned.title()
+
+
 def get_company_from_url(url: str) -> str | None:
-    """Identify companies using known career-site domains."""
+    """Dynamically identify the company name from any career URL or ATS link."""
+    if not url or not isinstance(url, str):
+        return None
 
-    hostname = urlparse(url).netloc.lower()
+    parsed = urlparse(url)
+    hostname = parsed.netloc.lower()
 
-    company_domains = {
-        "careers.ibm.com": "IBM",
-        "ibm.com": "IBM",
-        "careers.microsoft.com": "Microsoft",
-        "apply.careers.microsoft.com": "Microsoft",
-        "microsoft.com": "Microsoft",
-    }
+    if not hostname:
+        return None
 
-    for domain, company in company_domains.items():
-        if hostname == domain or hostname.endswith("." + domain):
-            return company
+    # 1. ATS where company is the path slug (e.g. jobs.lever.co/cred)
+    for ats_host in ATS_PATH_HOSTS:
+        if hostname == ats_host or hostname.endswith("." + ats_host):
+            parts = [p for p in parsed.path.strip("/").split("/") if p]
+            if parts and parts[0] not in ("jobs", "careers", "apply", "embed", "v1", "v2"):
+                return clean_company_name(parts[0])
+
+    # 2. ATS where company is the subdomain (e.g. swiggy.workdayjobs.com)
+    for suffix in ATS_SUBDOMAIN_SUFFIXES:
+        if hostname.endswith(suffix):
+            prefix = hostname[: -len(suffix)]
+            prefix = re.sub(r"\.wd\d+$", "", prefix)
+            slug = prefix.split(".")[-1]
+            if slug:
+                return clean_company_name(slug)
+
+    # 3. Direct company career sites (e.g. careers.flipkart.com, tcs.com)
+    clean_host = hostname.split(":")[0]
+    clean_host = re.sub(
+        r"^(?:www|careers?|jobs?|apply|recruiting?|talent|work|tech|corp)\.",
+        "",
+        clean_host,
+    )
+    clean_host = re.sub(
+        r"\.(?:com|co\.in|in|org|net|io|tech|co|ai|jobs|dev|app|global)$",
+        "",
+        clean_host,
+    )
+
+    slug = clean_host.split(".")[-1]
+    if slug and len(slug) >= 2 and slug not in ("search", "portal", "login"):
+        return clean_company_name(slug)
 
     return None
 
@@ -170,28 +288,34 @@ def extract_location(markdown: str, title: str | None) -> str | None:
 
 
 def extract_job_type(markdown: str) -> str | None:
-    """Extract employment type from explicit fields or the title/location area."""
+    """Extract employment type from explicit fields, title/location area, or title itself."""
 
     lines = markdown.splitlines()
 
-    # First, look for an explicit employment-type field.
+    # 1. Look for explicit metadata fields (Employment type, Contract type, Position type, Job type)
+    type_field_patterns = [
+        r"^(?:Employment|Contract|Position|Job|Workplace)\s+type",
+        r"^(?:Type\s+of\s+employment|Type\s+of\s+contract)",
+    ]
+
     for line in lines:
         cleaned = line.strip()
 
-        if re.match(r"Employment\s+type", cleaned, re.IGNORECASE):
-            value = re.sub(
-                r"^Employment\s+type\s*",
-                "",
-                cleaned,
-                flags=re.IGNORECASE,
-            ).strip(" :-|")
+        for pattern in type_field_patterns:
+            if re.match(pattern, cleaned, re.IGNORECASE):
+                value = re.sub(
+                    pattern,
+                    "",
+                    cleaned,
+                    flags=re.IGNORECASE,
+                ).strip(" :-|*`")
 
-            normalized = re.sub(r"\s+", " ", value).lower()
+                normalized = re.sub(r"\s+", " ", value).lower()
 
-            if normalized in JOB_TYPE_MAP:
-                return JOB_TYPE_MAP[normalized]
+                if normalized in JOB_TYPE_MAP:
+                    return JOB_TYPE_MAP[normalized]
 
-    # Otherwise, inspect the lines immediately after the job title.
+    # 2. Inspect the lines immediately after the job title.
     title = extract_title(markdown)
 
     if title:
@@ -204,17 +328,17 @@ def extract_job_type(markdown: str) -> str | None:
             if not heading or heading.group(1).strip() != title:
                 continue
 
-            for candidate_line in lines[index + 1:index + 8]:
+            for candidate_line in lines[index + 1 : index + 8]:
                 candidate = candidate_line.strip()
 
                 if not candidate:
                     continue
 
                 # Recognize a type joined directly to the location,
-                # such as "IndiaInternship".
+                # such as "IndiaInternship" or "IndiaRegular".
                 match = re.search(
-                    r"(Internship|Full[\s-]*Time|Part[\s-]*Time|"
-                    r"Contract|Temporary|Permanent)\s*$",
+                    r"(Internship|Intern|Full[\s-]*Time|Part[\s-]*Time|"
+                    r"Contract|Temporary|Permanent|Regular)\s*$",
                     candidate,
                     re.IGNORECASE,
                 )
@@ -232,6 +356,13 @@ def extract_job_type(markdown: str) -> str | None:
                 # Don't keep scanning through the whole job description.
                 if candidate.startswith(("#", "[", "-", "*")):
                     break
+
+        # 3. Infer from title if explicitly mentioned (e.g. "Software Engineer - Intern")
+        title_lower = title.lower()
+        if re.search(r"\b(?:intern|internship|apprentice|co-op)\b", title_lower):
+            return "Internship"
+        if re.search(r"\b(?:contractor|contract)\b", title_lower):
+            return "Contract"
 
     return None
 
